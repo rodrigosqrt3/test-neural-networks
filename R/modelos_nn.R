@@ -38,13 +38,20 @@ rede_distribucional <- nn_module(
   "rede_distribucional",
   initialize = function(n_in, cabeca, ocultas = c(64, 32), grau = 12, tau0 = 0.9,
                         xi_modo = "global", xi_lim = c(-0.6, 0.4), dropout = 0.1,
-                        n_estacoes = 0, dim_emb = 4) {
+                        n_estacoes = 0, dim_emb = 4, linear = FALSE, cauda_mm = FALSE,
+                        escala = c(0, 1), escala_cauda = 10) {
     self$cabeca <- cabeca; self$grau <- grau; self$tau0 <- tau0
+    # cauda_mm (só bgp, alvo treinado na raiz cúbica e padronizado com escala = c(média, dp)):
+    # o corpo fica na escala de treino e a cauda GPD acima de u(x) é montada em MM, onde a
+    # teoria de valores extremos se aplica; depois volta para a escala de treino. "Splice"
+    # corpo/cauda clássico (cf. Frigessi et al. 2002; MacDonald et al. 2011).
+    self$cauda_mm <- cauda_mm; self$escala <- escala; self$escala_cauda <- escala_cauda
     self$xi_modo <- xi_modo; self$xi_lim <- xi_lim
     self$usa_emb <- n_estacoes > 0
     # n_estacoes + 1 linhas: seguro tanto para índices 1..n quanto 0..n-1
     if (self$usa_emb) self$emb <- nn_embedding(n_estacoes + 1, dim_emb)
     camadas <- list(); d <- n_in + if (self$usa_emb) dim_emb else 0
+    d_in <- d
     for (h in ocultas) {
       camadas <- c(camadas, nn_linear(d, h), nn_elu(), nn_dropout(dropout)); d <- h
     }
@@ -52,6 +59,10 @@ rede_distribucional <- nn_module(
     n_out <- switch(cabeca, drn = 2, bqn = grau + 1,
                     bgp = grau + 1 + 1 + (xi_modo == "x"))
     self$saida <- nn_linear(d, n_out)
+    # linear = TRUE: caminho linear das entradas direto para os parâmetros ("wide & deep",
+    # Cheng et al. 2016). Para drn, mu = EMOS com todos os preditores + correção não linear.
+    self$linear <- linear
+    if (linear) self$lin <- nn_linear(d_in, n_out)
     if (cabeca == "bgp" && xi_modo == "global") self$xi_raw <- nn_parameter(torch_zeros(1))
   },
 
@@ -64,6 +75,7 @@ rede_distribucional <- nn_module(
   forward = function(x, tau, id = NULL) {
     if (self$usa_emb) x <- torch_cat(list(x, self$emb(id)), dim = 2)
     z <- self$saida(self$corpo(x))
+    if (self$linear) z <- z + self$lin(x)
     tau_t <- torch_tensor(tau, dtype = torch_float())
     if (self$cabeca == "drn") {
       mu <- z[, 1:1]; sig <- nnf_softplus(z[, 2:2]) + 1e-3
@@ -87,9 +99,18 @@ rede_distribucional <- nn_module(
     L <- torch_tensor(log((1 - self$tau0) / (1 - pmax(tau, self$tau0))),
                       dtype = torch_float())$unsqueeze(1)
     xiL <- xi * L
-    # (exp(xi L) - 1)/xi estável perto de xi = 0
-    fator <- torch_where(torch_abs(xi) < 1e-4, L * (1 + xiL / 2), torch_expm1(xiL) / xi)
-    q_cauda <- u + s * fator
+    # (exp(xi L) - 1)/xi estável perto de xi = 0. O torch calcula os DOIS ramos de
+    # torch_where; com xi ~ 0 o ramo descartado faria 0/0 e o NaN vazaria no gradiente
+    # (o bgp_xi divergiu assim no exp7). Por isso o ramo geral usa um xi afastado de 0.
+    perto <- torch_abs(xi) < 1e-4
+    xi_seg <- torch_where(perto, torch_ones_like(xi) * 1e-4, xi)
+    fator <- torch_where(perto, L * (1 + xiL / 2), torch_expm1(xi_seg * L) / xi_seg)
+    q_cauda <- if (!self$cauda_mm) u + s * fator else {
+      ym <- self$escala[1]; ys <- self$escala[2]
+      u_mm <- nnf_relu(u * ys + ym)^3                         # u(x) em mm (raiz cúbica -> mm)
+      cauda_mm <- u_mm + self$escala_cauda * s * fator         # GPD em mm; s em unidades de escala_cauda mm
+      ((cauda_mm + 1e-6)^(1 / 3) - ym) / ys                    # de volta à escala de treino
+    }
     m <- torch_tensor(corpo, dtype = torch_bool())$unsqueeze(1)
     list(q = torch_where(m, q_corpo, q_cauda), xi = xi, u = u, s = s)
   }
@@ -152,11 +173,18 @@ TAU_TREINO <- c((1:90 - 0.5) / 100, 0.9 + (1:100 - 0.5) / 1000)
 # pesos: pesos por amostra de treino (ex.: dar mais peso aos anos recentes).
 # Xva = NULL: sem validação; treina exatamente `epocas` épocas.
 # wd > 0: AdamW com esse weight decay (Loshchilov & Hutter 2019) em vez de Adam.
+# piso: distribuição censurada nesse valor (chuva: 0). Os quantis viram max(Q(tau), piso),
+#   o que dá massa P(Y = piso) e mantém o CRPS próprio (cf. EMOS censurado, Scheuerer 2014).
+# nitidez > 0: penalidade nitidez x largura média do intervalo de 80% (alvo padronizado),
+#   só no TREINO (cf. arXiv 2606.08587). val_pura = TRUE: a validação (early stopping e
+#   escolha de receita) usa sempre o CRPS sem pesos, mesmo com gama ou nitidez > 0, para
+#   que receitas diferentes sejam comparáveis.
 treinar_rede <- function(Xtr, ytr, Xva, yva, cabeca, gama = 0, tau_peso = 0.9,
                          lambda_xi = 0, seed = 1, epocas = 300, paciencia = 25,
                          lote = 128, lr = 2e-3, tau_treino = TAU_TREINO,
                          perda = c("crps", "hibrida"), lambda_nll = 1, pesos = NULL,
-                         id_tr = NULL, id_va = NULL, wd = 0, ...) {
+                         id_tr = NULL, id_va = NULL, wd = 0, piso = NULL,
+                         nitidez = 0, val_pura = FALSE, clip = 0, ...) {
   perda <- match.arg(perda)
   torch_manual_seed(seed); set.seed(seed)
   fim <- 1
@@ -170,15 +198,19 @@ treinar_rede <- function(Xtr, ytr, Xva, yva, cabeca, gama = 0, tau_peso = 0.9,
   # mean(QS * v) aproxime (1/fim) integral QS dtau
   v <- .larguras(tau_treino, fim) * (1 + gama * (tau_treino > tau_peso))
   v <- v / sum(v) * length(tau_treino)
-  funcao_perda <- function(out, y, w = NULL) {
-    p <- .perda_qw(out$q, y, tau_treino, v, w)
+  v0 <- .larguras(tau_treino, fim); v0 <- v0 / sum(v0) * length(tau_treino)
+  i10 <- which.min(abs(tau_treino - 0.1)); i90 <- which.min(abs(tau_treino - 0.9))
+  funcao_perda <- function(out, y, w = NULL, vv = v) {
+    q <- if (is.null(piso)) out$q else torch_clamp(out$q, min = (piso - ym) / ys)
+    p <- .perda_qw(q, y, tau_treino, vv, w)
     if (perda == "hibrida") p <- p + lambda_nll * .perda_gpd_nll(out$u, out$s, out$xi, y)
     p
   }
-  rede <- rede_distribucional(ncol(Xtr), cabeca, ...)
-  opt <- otimizador(rede, lr, wd)
-  # alvo padronizado com média/desvio do TREINO (xi é invariante a isso)
+  # alvo padronizado com média/desvio do TREINO (xi é invariante a isso); a rede recebe essa
+  # escala para poder montar a cauda em mm (cauda_mm)
   ym <- mean(ytr); ys <- stats::sd(ytr)
+  rede <- rede_distribucional(ncol(Xtr), cabeca, escala = c(ym, ys), ...)
+  opt <- otimizador(rede, lr, wd)
   ytr <- (ytr - ym) / ys
   xtr <- torch_tensor(Xtr, dtype = torch_float()); ytr_t <- torch_tensor(ytr, dtype = torch_float())
   w_t <- if (is.null(pesos)) NULL else torch_tensor(pesos / mean(pesos), dtype = torch_float())
@@ -203,11 +235,18 @@ treinar_rede <- function(Xtr, ytr, Xva, yva, cabeca, gama = 0, tau_peso = 0.9,
       valor <- funcao_perda(out, ytr_t[idx, drop = FALSE], if (is.null(w_t)) NULL else w_t[idx, drop = FALSE])
       if (!is.null(out$xi) && lambda_xi > 0)
         valor <- valor + lambda_xi * torch_mean((out$xi - torch_mean(out$xi))^2)
-      valor$backward(); opt$step()
+      if (nitidez > 0) valor <- valor + nitidez * torch_mean(out$q[, i90] - out$q[, i10])
+      valor$backward()
+      if (clip > 0) nn_utils_clip_grad_norm_(rede$parameters, clip)    # chuva: dias de 200+ mm
+      opt$step()
     }
     if (!com_validacao) next
     rede$eval()
-    pv <- with_no_grad(funcao_perda(rede(xva, tau_treino, idva_t), yva_t))$item()
+    pv <- with_no_grad(funcao_perda(rede(xva, tau_treino, idva_t), yva_t, vv = if (val_pura) v0 else v))$item()
+    if (!is.finite(pv)) {                     # divergiu: fica a melhor época até aqui
+      if (is.null(melhor_estado)) stop("treinar_rede: a perda de validação virou NaN já na 1ª época")
+      break
+    }
     hist <- c(hist, pv)
     if (pv < melhor - 1e-5) {
       melhor <- pv; sem_melhora <- 0; melhor_epoca <- ep

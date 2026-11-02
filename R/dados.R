@@ -78,9 +78,12 @@ ler_inmet_completo <- function(pasta) {
   }))[!is.na(utc)][order(utc)]
 }
 
+# `pres` é a pressão NA ESTAÇÃO (pressure_station_hpa), não a do nível do mar: até 26/10/2026
+# a faixa era 950–1050 hPa e apagava a pressão das 9 estações acima de ~600 m (serra e
+# planalto, ~880–940 hPa). No RS a pressão na estação fica entre ~850 e ~1045 hPa.
 qc_inmet_completo <- function(h) {
   h[!(chuva >= 0 & chuva <= 150), chuva := NA]
-  h[!(pres >= 950 & pres <= 1050), pres := NA]
+  h[!(pres >= 800 & pres <= 1050), pres := NA]
   h[!(rad >= 0 & rad <= 5000), rad := NA]
   h[!(temp >= -5 & temp <= 45), temp := NA]
   h[!(orv >= -15 & orv <= 35) | orv > temp + 0.5, orv := NA]
@@ -133,6 +136,16 @@ variaveis_estacao <- function(h, init_dates) {
 }
 
 # --- Multi-estação (INMET via rmet + GEFS na caixa do RS) ----------------------
+
+# QC do rmet (faixa, consistência, picos e sensor travado; ?rmet::inmet_qc) nos dados
+# horários brutos, ANTES de inmet_para_horario. Usado só nos PREDITORES da estação
+# (variaveis_estacao): os alvos (Tmax e chuva diárias) continuam com qc_inmet /
+# qc_inmet_completo, para que as linhas e os valores observados de todos os experimentos
+# continuem os mesmos.
+qc_rmet <- function(d) {
+  d <- as.data.frame(d)
+  as.data.table(rmet::inmet_qc(d, action = "remove", quiet = TRUE))
+}
 
 # Dados horários do rmet -> nomes usados pelas funções acima (qc_inmet,
 # tmax_diaria, tmax_parcial_vespera, qc_inmet_completo, variaveis_estacao)

@@ -17,6 +17,10 @@ library(data.table)
 DOBRAS <- list(f1 = as.Date(c("2006-12-31", "2008-12-31", "2011-12-31")),
                f2 = as.Date(c("2009-12-31", "2011-12-31", "2015-12-31")),
                f3 = as.Date(c("2011-12-31", "2015-12-31", "2019-12-31")))
+# exp14: teste no período OPERACIONAL (GEFS operacional desde 24/09/2020). Treino 2000–17, validação
+# 2018–19 (só para os pesos do stack); o modelo final é refeito em 2000–19, como nas outras dobras.
+# Fora de DOBRAS para os scripts antigos não a pegarem; montar_tabela_multi(oper = TRUE) traz as linhas.
+DOBRA_OPER <- list(op = as.Date(c("2017-12-31", "2019-12-31", "2025-12-31")))
 GAP_DIAS <- 7
 MIN_TREINO <- 365
 TAU_FINO <- (1:99) / 100                 # quantis guardados por caso (para combinações)
@@ -97,11 +101,17 @@ distancias_km <- function(est) {
 # --- tabela de modelagem ------------------------------------------------------------------
 # Uma linha por (estação, rodada) com alvo observado e ensemble disponível.
 # extras = TRUE acrescenta F_ERROS (exp6); as linhas são as mesmas nos dois casos.
-montar_tabela_multi <- function(H, estacoes = NULL, extras = FALSE) {
+# oper = TRUE junta o período operacional 2020–25 (arquivos *_oper.rds; script 14 com FONTE=oper).
+ler_multi <- function(nome, oper = FALSE) {
+  x <- readRDS(sprintf("dados/processados/multi_%s.rds", nome))
+  if (oper) x <- rbind(x, readRDS(sprintf("dados/processados/multi_%s_oper.rds", nome)), use.names = TRUE, fill = TRUE)
+  x
+}
+montar_tabela_multi <- function(H, estacoes = NULL, extras = FALSE, oper = FALSE) {
   est <- readRDS("dados/processados/multi_estacoes.rds")
-  g <- readRDS("dados/processados/multi_gefs.rds")
-  od <- readRDS("dados/processados/multi_obs_dia.rds")
-  oi <- readRDS("dados/processados/multi_obs_init.rds")
+  g <- ler_multi("gefs", oper)
+  od <- ler_multi("obs_dia", oper)
+  oi <- ler_multi("obs_init", oper)
   if (!is.null(estacoes)) {
     est <- est[estacao %in% estacoes]; g <- g[estacao %in% estacoes]
     od <- od[estacao %in% estacoes]; oi <- oi[estacao %in% estacoes]
@@ -158,7 +168,7 @@ adicionar_clim <- function(sp) {
 }
 
 dividir_dobra <- function(d, dobra) {
-  k <- DOBRAS[[dobra]]
+  k <- c(DOBRAS, DOBRA_OPER)[[dobra]]
   tr <- d[valid_date <= k[1]]
   ok <- tr[, .N, by = estacao][N >= MIN_TREINO, estacao]
   list(tr = tr[estacao %in% ok],
@@ -171,7 +181,9 @@ dividir_dobra <- function(d, dobra) {
 # Devolve os três blocos imputados e a lista final de preditores.
 imputar <- function(sp, feats, grupos) {
   medias <- vapply(feats, function(v) mean(sp$tr[[v]], na.rm = TRUE), numeric(1))
-  medias[!is.finite(medias)] <- 0
+  # preditor sem nenhum valor no treino: sai (imputado como constante, ele ainda chegaria
+  # na validação/teste com os valores brutos, fora da escala da padronização)
+  feats <- feats[is.finite(medias)]; medias <- medias[is.finite(medias)]
   grupos <- Filter(function(g) length(intersect(g, feats)) > 0, grupos)
   aplicar <- function(x) {
     x <- copy(x)
@@ -343,6 +355,55 @@ modelo_emos_bst <- function(sp, feats, m_max = 2000, nu = 0.3) {
        info = list(iteracoes = unlist(m)))
 }
 
+# --- Chuva: EMOS gama censurado e deslocado (CSGD; Scheuerer & Hamill 2015) ---------------
+# Y = max(0, delta + G), G ~ Gama(k, theta), com média mu e dp sigma de G + delta:
+#   mu    = softplus(b0 + b1 média_ens + b2 P(>1 mm) + b3 controle + b4 sen + b5 cos)
+#   sigma = softplus(g0 + g1 sqrt(mu) + g2 dp_ens);   delta = -softplus(d0)
+#   k = mu^2 / sigma^2, theta = sigma^2 / mu
+# Um ajuste por estação por CRPS mínimo (fórmula fechada, conferida contra integração
+# numérica: diferença < 1e-7). Preditores de chuva em mm (desfazendo o log1p da tabela).
+crps_csg <- function(y, k, theta, delta) {
+  yt <- (y - delta) / theta; ct <- -delta / theta
+  Fy <- stats::pgamma(yt, k); Fy1 <- stats::pgamma(yt, k + 1)            # cada CDF uma vez só
+  Fc <- stats::pgamma(ct, k); Fc1 <- stats::pgamma(ct, k + 1); F2 <- stats::pgamma(2 * ct, 2 * k)
+  theta * yt * (2 * Fy - 1) - theta * ct * Fc^2 + theta * k * (1 + 2 * Fc * Fc1 - Fc^2 - 2 * Fy1) -
+    theta * k / pi * beta(0.5, k + 0.5) * (1 - F2)
+}
+.sp <- function(x) log1p(exp(-abs(x))) + pmax(x, 0)            # softplus estável
+.csgd_par <- function(par, X) {
+  mu <- .sp(drop(X$m %*% par[1:6])) + 1e-3
+  sig <- .sp(par[7] + par[8] * sqrt(mu) + par[9] * X$dp) + 1e-3
+  list(k = mu^2 / sig^2, theta = sig^2 / mu, delta = -.sp(par[10]))
+}
+.csgd_X <- function(x) list(m = cbind(1, expm1(x$chuva_ens_media), x$chuva_p1mm, expm1(x$ctrl_chuva_dia),
+                                      x$doy_sen, x$doy_cos),
+                            dp = expm1(x$chuva_ens_dp))
+# ini: parâmetros de partida (a etapa 2 parte da etapa 1). reltol 1e-6: abaixo disso o CRPS
+# médio não muda na 4ª casa, e o ajuste fica ~5x mais rápido que com o padrão do optim.
+csgd_ajustar <- function(x, y, ini = NULL) {
+  X <- .csgd_X(x)
+  perda <- function(par) { p <- .csgd_par(par, X); v <- mean(crps_csg(y, p$k, p$theta, p$delta)); if (is.finite(v)) v else 1e10 }
+  if (is.null(ini)) ini <- c(log(expm1(max(mean(y), 0.1))), 0.5, 0, 0.2, 0, 0, log(expm1(max(stats::sd(y), 0.5))), 0.5, 0.3, 0)
+  fit <- stats::optim(ini, perda, method = "BFGS", control = list(maxit = 300, reltol = 1e-6))
+  structure(list(par = fit$par, conv = fit$convergence), class = "csgd")
+}
+predict.csgd <- function(object, x, ...) {
+  p <- .csgd_par(object$par, .csgd_X(x)); n <- nrow(x); K <- length(TAU_GRADE)
+  q <- stats::qgamma(rep(TAU_GRADE, each = n), shape = rep(p$k, K), scale = rep(p$theta, K))
+  pmax(matrix(q, n, K) + p$delta, 0)
+}
+# em duas etapas (como os outros modelos): etapa 1 no treino prevê a validação; etapa 2 em
+# treino + validação, partindo dos parâmetros da etapa 1, prevê o teste
+modelo_csgd <- function(sp) {
+  fits <- lapply(split(sp$tr, by = "estacao"), function(a) csgd_ajustar(a, a$tmax))
+  tv <- com_tv(sp)$tr
+  finais <- setNames(lapply(names(fits), function(s) { a <- tv[estacao == s]; csgd_ajustar(a, a$tmax, fits[[s]]$par) }), names(fits))
+  f <- function(fit, x) predict(fit, x)
+  conv <- vapply(c(fits, finais), `[[`, 0L, "conv")
+  list(va = por_estacao(fits, sp$va, f), te = por_estacao(finais, sp$te, f),
+       info = list(nao_convergiu = sum(conv != 0)))
+}
+
 # Boosting de árvores (xgboost) global, normal heterocedástica: árvores para a média
 # (erro quadrático; nº de árvores pela validação) e outras para a variância, ajustadas
 # nos quadrados dos resíduos FORA DA AMOSTRA do treino (4 blocos de tempo), com perda
@@ -407,17 +468,29 @@ modelo_gbm <- function(sp, feats, threads, n_max = 3000) {
 # Rede (MLP) em duas etapas: cada semente treina com early stopping na validação e
 # depois é treinada de novo, do zero, em treino + validação pelo mesmo nº de épocas.
 # receitas: lista nomeada de listas de argumentos (treinar_rede / rede_distribucional).
-modelo_rede2 <- function(sp, feats, cabeca, n_estacoes, n_redes, epocas, receitas, seed0 = 100) {
+# transf: list(f, inv) para treinar numa escala transformada (chuva: raiz cúbica); os
+#   quantis voltam pela inversa, que é monótona, então continuam sendo quantis de Y.
+# piso: censura (na escala de treino), ver treinar_rede.
+modelo_rede2 <- function(sp, feats, cabeca, n_estacoes, n_redes, epocas, receitas, seed0 = 100,
+                         transf = NULL, piso = NULL) {
+  f_ <- if (is.null(transf)) identity else transf$f
+  inv <- if (is.null(transf)) identity else transf$inv
   padr <- padronizador(sp$tr, feats); Xtr <- padr(sp$tr); Xva <- padr(sp$va)
-  treinar <- function(r, seed, X = Xtr, y = sp$tr$tmax, id = sp$tr$id, Xv = Xva, ep = epocas)
-    do.call(treinar_rede, c(list(Xtr = X, ytr = y, Xva = Xv, yva = sp$va$tmax, id_tr = id, id_va = sp$va$id,
-                                 n_estacoes = n_estacoes, cabeca = cabeca, epocas = ep, seed = seed), r))
+  treinar <- function(r, seed, X = Xtr, y = f_(sp$tr$tmax), id = sp$tr$id, Xv = Xva, ep = epocas)
+    do.call(treinar_rede, c(list(Xtr = X, ytr = y, Xva = Xv, yva = f_(sp$va$tmax), id_tr = id, id_va = sp$va$id,
+                                 n_estacoes = n_estacoes, cabeca = cabeca, epocas = ep, seed = seed, piso = piso), r))
   esc <- .escolher(receitas, treinar)
   conj <- lapply(seq_len(n_redes), function(k) treinar(esc$receita, seed0 + k))
   tv <- com_tv(sp)$tr; padr2 <- padronizador(tv, feats); Xtv <- padr2(tv)
   final <- lapply(seq_along(conj), function(k)
-    treinar(esc$receita, seed0 + k, Xtv, tv$tmax, tv$id, NULL, max(3L, conj[[k]]$melhor_epoca)))
-  f <- function(cj, p, x) { X <- p(x); function(i) prever_conjunto(cj, X[i, , drop = FALSE], x$id[i]) }
+    treinar(esc$receita, seed0 + k, Xtv, f_(tv$tmax), tv$id, NULL, max(3L, conj[[k]]$melhor_epoca)))
+  f <- function(cj, p, x) {
+    X <- p(x)
+    function(i) {
+      q <- prever_conjunto(cj, X[i, , drop = FALSE], x$id[i])
+      inv(if (is.null(piso)) q else pmax(q, piso))
+    }
+  }
   info <- list(receita = esc$nome, val_receitas = esc$val,
                melhor_epoca = vapply(conj, `[[`, 0, "melhor_epoca"),
                melhor_val = vapply(conj, `[[`, 0, "melhor_val"))

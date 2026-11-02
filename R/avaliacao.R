@@ -39,12 +39,17 @@ prob_excedencia <- function(q, t, tau = TAU_GRADE) {
 
 brier <- function(p, y, t) mean((p - (y > t))^2)
 
-# PIT aleatorizado a partir da grade (para histogramas / calibração)
+# PIT aleatorizado a partir da grade (para histogramas / calibração). Se a observação cai
+# sobre uma massa de probabilidade (vários quantis iguais a y, como o 0 da chuva num dia
+# seco), o PIT é sorteado uniforme entre F(y-) e F(y) (Czado, Gneiting & Held 2009);
+# antes ele ia para o primeiro nível empatado, o que derrubava a cobertura da chuva.
 pit_quantis <- function(q, y, tau = TAU_GRADE) {
   vapply(seq_len(nrow(q)), function(i) {
     qi <- q[i, ]
-    if (y[i] <= qi[1]) return(stats::runif(1, 0, tau[1]))
-    if (y[i] >= qi[length(qi)]) return(stats::runif(1, tau[length(tau)], 1))
+    k_lo <- sum(qi < y[i]); k_hi <- sum(qi <= y[i])
+    if (k_hi > k_lo) return(stats::runif(1, if (k_lo == 0) 0 else tau[k_lo], if (k_hi == length(tau)) 1 else tau[k_hi]))
+    if (y[i] < qi[1]) return(stats::runif(1, 0, tau[1]))
+    if (y[i] > qi[length(qi)]) return(stats::runif(1, tau[length(tau)], 1))
     stats::approx(qi, tau, xout = y[i], ties = "ordered")$y
   }, numeric(1))
 }
